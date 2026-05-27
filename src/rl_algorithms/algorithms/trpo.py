@@ -1,3 +1,4 @@
+import argparse
 import gymnasium as gym
 import numpy as np
 import torch
@@ -197,8 +198,16 @@ class TRPOAgent:
             avg_ep_rewards.update(batch.rewards.sum().item())
             act_losses.append(act_loss)
             cr_losses.append(cr_loss)
-            
-            pbar.set_description(f"Episode: {ep} | Average Rewards: {avg_ep_rewards.get_average:.3f} | Act Loss: {act_losses[-1]:.3f} | Critic Loss: {cr_losses[-1]:.3f} | KL Div: {kl:.4f} | Num updates: {n_updates}")
+
+            postfix = {}
+            postfix["avg_rew"] = avg_ep_rewards.get_average
+            postfix["act_loss"] = act_losses[-1]
+            postfix["critic_loss"] = cr_losses[-1]
+            postfix["kl_div"] = kl
+            postfix["num_updates"] = n_updates
+        
+            pbar.set_description(f"Episode: {ep}")
+            pbar.set_postfix(postfix)
         
         return act_losses, cr_losses
     
