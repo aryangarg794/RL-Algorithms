@@ -94,11 +94,10 @@ class TRPOAgent:
         n_envs: int = 5, 
         batch_size: int = 128, 
         n_steps: int = 512,
-        n_update_steps: int = 1000, 
         *args, 
         **kwargs
     ):
-        self.runner = Runner(env_id, device=device, n_envs=n_envs, n_steps=n_steps, n_update_steps=n_update_steps)
+        self.runner = Runner(env_id, device=device, n_envs=n_envs, n_steps=n_steps)
         self.categorical = True if isinstance(self.runner.envs.action_space, (Discrete, MultiDiscrete)) else False
         self.action_shape = self.runner.envs.single_action_space.n if self.categorical else self.runner.action_shape
         self.obs_shape = self.runner.obs_shape
@@ -111,7 +110,6 @@ class TRPOAgent:
         self.n_envs = n_envs
         self.batch_size = batch_size
         self.n_steps = n_steps
-        self.n_update_steps = n_update_steps
 
         if self.categorical:
             self.actor = ActorDisc(self.obs_shape, self.action_shape, act_hidden=act_hidden, act=act).to(device)
@@ -190,12 +188,13 @@ class TRPOAgent:
     def kl_div(self, dist_new: dist.Distribution, dist_old: dist.Distribution):
         return torch.distributions.kl_divergence(dist_new, dist_old).mean()
     
-    def train(self, window_size: int = 100):
+    def train(self, total_timesteps: int, window_size: int = 100):
         act_losses = []
         cr_losses = []
         n_updates = 0
         
-        for ep in (pbar := tqdm(range(1, self.n_update_steps+1))):
+        num_eps = int(total_timesteps / (self.n_envs * self.n_steps))
+        for ep in (pbar := tqdm(range(1, num_eps+1))):
             rollout_data = self.runner.run_rollout(self)
             act_loss, cr_loss, kl, updated = self.update_step(rollout_data)
             n_updates += int(updated)
@@ -214,6 +213,18 @@ class TRPOAgent:
         
         return act_losses, cr_losses
     
+    
+    def get_distribution(self, states: Tensor):
+        if self.categorical:
+            logits = self(states)
+            dist_new = dist.Categorical(logits=logits)
+        else:
+            means, stds = self(states)
+            dist_new = dist.Normal(loc=means, scale=stds)
+
+        return dist_new
+
+
     def update_step(self, rollout_data: RolloutBufferBatch):
         for batch in rollout_data.get(batch_size=None):
             with torch.no_grad():
@@ -229,13 +240,7 @@ class TRPOAgent:
             if self.norm_adv:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             advantages = advantages.detach()
-            actor_loss, dist_new = self.actor_loss(batch.states, batch.actions, advantages, batch.log_probs)
-            
-            # kl grads
-            kl = self.kl_div(dist_new, dist_old)
-            grads_kl = torch.autograd.grad(kl, self.actor.parameters(), create_graph=True, retain_graph=True, 
-                                        allow_unused=True)
-            flat_grads_kl = self.flatten_grads(grads_kl)
+            actor_loss, _ = self.actor_loss(batch.states, batch.actions, advantages, batch.log_probs)            
 
             # grads point in dir to maximize (ie lower reward)
             grads_pg = torch.autograd.grad(actor_loss, self.actor.parameters(), retain_graph=True) 
@@ -243,9 +248,16 @@ class TRPOAgent:
             
             # fisher-vector product
             def FVP(y: Tensor):
+                # kl grads
+                dist_new = self.get_distribution(batch.states)
+                kl = self.kl_div(dist_new, dist_old)
+                grads_kl = torch.autograd.grad(kl, self.actor.parameters(), create_graph=True, retain_graph=True, 
+                                            allow_unused=True)
+                flat_grads_kl = self.flatten_grads(grads_kl)
+
                 prod = torch.dot(flat_grads_kl, y)
                 # second derivative
-                grads = torch.autograd.grad(prod, self.actor.parameters(), retain_graph=True)
+                grads = torch.autograd.grad(prod, self.actor.parameters())
                 flat_grads = torch.cat([grad.contiguous().view(-1) for grad in grads]).data
                 
                 return flat_grads + y * self.damping
@@ -299,10 +311,10 @@ class TRPOAgent:
 if __name__ == "__main__":
     # test run
     agent = TRPOAgent(
-        'Swimmer-v5', 
+        'CartPole-v1', 
         device='cpu',
         n_envs=1, 
         n_steps=2048, 
         n_update_steps=2000,
     )
-    agent.train(window_size=100)
+    agent.train(total_timesteps=700000, window_size=100)

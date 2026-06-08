@@ -182,7 +182,6 @@ class Runner:
         env_id: str, 
         device: str = 'cuda',
         n_steps: int = 512, 
-        n_update_steps: int = 1000, 
         n_envs: int = 8, 
         discount: float = 0.99
     ):
@@ -193,7 +192,7 @@ class Runner:
         envs = gym.make_vec(env_id, num_envs=n_envs)
             
         self.envs = gym.wrappers.vector.RecordEpisodeStatistics(
-            envs, buffer_length=n_envs * n_update_steps
+            envs, buffer_length=1000
         )
 
         categorical = isinstance(self.envs.single_action_space, Discrete)
