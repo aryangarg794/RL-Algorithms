@@ -9,7 +9,7 @@ def conjugate_gradient(
     FVP: Callable, 
     b: Tensor, 
     max_iter: int = 15, 
-    eps: float = 1e-6, 
+    eps: float = 1e-10, 
     device: str = 'cuda'
 ):
     x = 1e-4 * torch.randn_like(b, device=device) # based on sb3 implementation 
@@ -39,11 +39,11 @@ def backtracking_linesearch_with_kl(
     model, 
     batch: Tensor,
     advantages: Tensor, 
-    old_dist: tuple,
+    dist_old: torch.distributions.Distribution,
     step_dir: Tensor, 
     start: float, 
     initial_loss: float | Tensor, 
-    c: float = 0.8, 
+    c: float = 0.5, 
     max_iter: int = 10
 ):
     update = False
@@ -53,11 +53,8 @@ def backtracking_linesearch_with_kl(
     for i in range(max_iter):
         new_params = old_weights + expn * step_dir
         model.update_actor_weights(new_params)
-        act_loss, _ = model.actor_loss(batch.states, batch.actions, advantages, old_dist)
-        if model.categorical:
-            kl = model.kl_categorical(batch.states, old_dist).mean()
-        else:
-            kl = model.kl_gaussian(batch.states, old_dist).mean()
+        act_loss, dist_new = model.actor_loss(batch.states, batch.actions, advantages, batch.log_probs)
+        kl = model.kl_div(dist_new, dist_old)
         if act_loss > old_loss and kl <= model.trust_region:
             update = True
             break

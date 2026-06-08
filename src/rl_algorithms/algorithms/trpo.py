@@ -6,13 +6,14 @@ import torch.nn as nn
 
 from copy import deepcopy
 from gymnasium.spaces.discrete import Discrete
+from gymnasium.spaces.multi_discrete import MultiDiscrete
 from torch import Tensor
 from torch import distributions as dist
 from tqdm import tqdm
 
 from rl_algorithms.common.optimization_methods import conjugate_gradient, backtracking_linesearch_with_kl
-from rl_algorithms.common.buffers import EpisodeBatch, Runner
-from rl_algorithms.common.utils import RollingAverage
+from rl_algorithms.common.buffers import RolloutBufferBatch, Runner
+from rl_algorithms.common.utils import explained_variance
 
 # some inspiration take from https://github.com/ikostrikov/pytorch-trpo (particularly grad directions etc)
 
@@ -80,7 +81,7 @@ class TRPOAgent:
     def __init__(
         self, 
         env_id: str,
-        lr_critic: float = 1e-4,
+        lr_critic: float = 1e-3,
         discount: float = 0.99, 
         trust_region: float = 0.01,
         act_hidden: list = list([400, 300]),
@@ -89,18 +90,28 @@ class TRPOAgent:
         damping: float = 0.1, 
         device: str = 'cuda', 
         num_critic_updates: int = 10, 
+        norm_adv: bool = True, 
+        n_envs: int = 5, 
+        batch_size: int = 128, 
+        n_steps: int = 512,
+        n_update_steps: int = 1000, 
         *args, 
         **kwargs
     ):
-        self.runner = Runner(env_id, device=device)
-        self.categorical = True if isinstance(self.runner.env.action_space, Discrete) else False
-        self.action_shape = self.runner.env.action_space.n if self.categorical else np.prod(self.runner.env.action_space.shape)
-        self.obs_shape = np.prod(self.runner.env.observation_space.shape)
+        self.runner = Runner(env_id, device=device, n_envs=n_envs, n_steps=n_steps, n_update_steps=n_update_steps)
+        self.categorical = True if isinstance(self.runner.envs.action_space, (Discrete, MultiDiscrete)) else False
+        self.action_shape = self.runner.envs.single_action_space.n if self.categorical else self.runner.action_shape
+        self.obs_shape = self.runner.obs_shape
         self.discount = discount
         self.trust_region = trust_region
         self.damping = damping
         self.device = device
         self.critic_steps = num_critic_updates
+        self.norm_adv = norm_adv
+        self.n_envs = n_envs
+        self.batch_size = batch_size
+        self.n_steps = n_steps
+        self.n_update_steps = n_update_steps
 
         if self.categorical:
             self.actor = ActorDisc(self.obs_shape, self.action_shape, act_hidden=act_hidden, act=act).to(device)
@@ -131,14 +142,24 @@ class TRPOAgent:
             return means, stds
     
     @torch.no_grad()
-    def sample_action(self, states: Tensor):
+    def sample_action(self, states: Tensor | np.ndarray, return_np: bool = False):
+        if isinstance(states, np.ndarray):
+            states = torch.from_numpy(states).reshape(-1, self.obs_shape).float()
         if self.categorical:
             logits = self(states)
-            return dist.Categorical(logits=logits).sample()
+            act_dist = dist.Categorical(logits=logits)
         else:
             means, stds = self(states)
-            return dist.Normal(loc=means, scale=stds).sample()
+            act_dist = dist.Normal(loc=means, scale=stds)
+
+        sample = act_dist.sample()
+        log_probs = act_dist.log_prob(sample)
         
+        return (
+            sample.cpu().numpy() if return_np else sample, 
+            log_probs.view(-1, 1) if self.categorical else log_probs.sum(dim=-1, keepdim=True),
+        )
+    
     def update_actor_weights(self, new_params: Tensor):
         offset = 0
         for param in list(self.actor.parameters()):
@@ -148,59 +169,41 @@ class TRPOAgent:
             offset += n 
             
     
-    def actor_loss_cont(self, states: Tensor, actions: Tensor, advantages: Tensor, old_prob: tuple):
-        old_means, old_std = old_prob
+    def actor_loss_cont(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: tuple):
         new_means, new_std = self(states)
         dist_new = dist.Normal(loc=new_means, scale=new_std)
-        dist_old = dist.Normal(loc=old_means, scale=old_std)
-        log_std_new = dist_new.log_prob(actions).sum(1, keepdim=True)
-        log_std_old = dist_old.log_prob(actions).sum(1, keepdim=True)
-        ratios = torch.exp(log_std_new - log_std_old)
-    
-        return (advantages * ratios).mean(), (new_means, new_std)
-    
-    def actor_loss_disc(self, states: Tensor, actions: Tensor, advantages: Tensor, old_prob: tuple):
-        old_logits = old_prob
-        new_logits = self(states)
-        dist_new = dist.Categorical(logits=new_logits)
-        dist_old = dist.Categorical(logits=old_logits)
+        log_std_new = dist_new.log_prob(actions)
 
-        log_std_new = dist_new.log_prob(actions.squeeze()).view(-1, 1)
-        log_std_old = dist_old.log_prob(actions.squeeze()).view(-1, 1)
-        ratios = torch.exp(log_std_new - log_std_old)
-        
-        return (advantages * ratios).mean(), (new_logits)
+        ratios = torch.exp(log_std_new - old_log_probs).sum(1, keepdim=True)
     
-    def kl_gaussian(self, states: Tensor, old_dist: tuple):
-        a_mean, a_std = old_dist
-        b_mean, b_std = self(states)
-        kl = 0.5 * (torch.log(b_std.pow(2)/(a_std.pow(2) + 1e-6)) - 1 + (b_std/(a_std + 1e-6)) 
-                      + (b_mean - a_mean).pow(2)/(b_std.pow(2) + 1e-6))
-        return kl.sum(1, keepdim=True)
+        return (advantages * ratios).mean(), dist_new
     
-    def kl_categorical(self, states, old_dist: tuple):
-        old_logits = old_dist
+    def actor_loss_disc(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: tuple):
         new_logits = self(states)
         dist_new = dist.Categorical(logits=new_logits)
-        dist_old = dist.Categorical(logits=old_logits)
-        return torch.distributions.kl_divergence(dist_old, dist_new)
+
+        log_std_new = dist_new.log_prob(actions.squeeze().long()).view(-1, 1)
+        ratios = torch.exp(log_std_new - old_log_probs)
+        
+        return (advantages * ratios).mean(), dist_new
     
-    def train(self, num_episodes: int = 500, window_size: int = 10):
+    def kl_div(self, dist_new: dist.Distribution, dist_old: dist.Distribution):
+        return torch.distributions.kl_divergence(dist_new, dist_old).mean()
+    
+    def train(self, window_size: int = 100):
         act_losses = []
         cr_losses = []
-        avg_ep_rewards = RollingAverage(window_size)
         n_updates = 0
         
-        for ep in (pbar := tqdm(range(1, num_episodes+1))):
-            batch = self.runner.run_trajectory(self, self.discount)
-            act_loss, cr_loss, kl, updated = self.update_step(batch)
-            n_updates += 1 if updated else 0
-            avg_ep_rewards.update(batch.rewards.sum().item())
+        for ep in (pbar := tqdm(range(1, self.n_update_steps+1))):
+            rollout_data = self.runner.run_rollout(self)
+            act_loss, cr_loss, kl, updated = self.update_step(rollout_data)
+            n_updates += int(updated)
             act_losses.append(act_loss)
             cr_losses.append(cr_loss)
 
             postfix = {}
-            postfix["avg_rew"] = avg_ep_rewards.get_average
+            postfix["avg_rew"] = np.mean(list(self.runner.envs.return_queue)[-window_size:])
             postfix["act_loss"] = act_losses[-1]
             postfix["critic_loss"] = cr_losses[-1]
             postfix["kl_div"] = kl
@@ -211,71 +214,66 @@ class TRPOAgent:
         
         return act_losses, cr_losses
     
-    def update_step(self, batch: EpisodeBatch):
-        with torch.no_grad():
-            if self.categorical:
-                old_probs = self(batch.states)
-            else:
-                old_means, old_stds = self(batch.states)
-        # compute advs
-        with torch.no_grad():
-            values = self.critic(batch.states)
-            next_values = self.critic(batch.next_states)
-        advantages = batch.rewards + self.discount * next_values * (1 - batch.dones) - values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-        if self.categorical:
-            actor_loss, _ = self.actor_loss_disc(batch.states, batch.actions, advantages, (old_probs))
-        else:
-            actor_loss, _ = self.actor_loss_cont(batch.states, batch.actions, advantages, (old_means, old_stds))
-        
-        # grads point in dir to maximize (ie lower reward)
-        grads_pg = torch.autograd.grad(actor_loss, self.actor.parameters()) 
-        grads_pg = torch.cat([grad.view(-1) for grad in grads_pg])
-        
-        # fisher-vector product
-        def FVP(y: Tensor):
-            if self.categorical:
-                kl = self.kl_categorical(batch.states, (old_probs.detach())).mean()
-            else:
-                kl = self.kl_gaussian(batch.states, (old_means.detach(), old_stds.detach())).mean()
-            grads = torch.autograd.grad(kl, self.actor.parameters(), create_graph=True, retain_graph=True, 
+    def update_step(self, rollout_data: RolloutBufferBatch):
+        for batch in rollout_data.get(batch_size=None):
+            with torch.no_grad():
+                if self.categorical:
+                    old_logits = self(batch.states)
+                    dist_old = dist.Categorical(logits=old_logits.detach())
+                else:
+                    old_means, old_stds = self(batch.states)
+                    dist_old = dist.Normal(loc=old_means.detach(), scale=old_stds.detach())
+
+            # compute advs
+            advantages = batch.advantages
+            if self.norm_adv:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = advantages.detach()
+            actor_loss, dist_new = self.actor_loss(batch.states, batch.actions, advantages, batch.log_probs)
+            
+            # kl grads
+            kl = self.kl_div(dist_new, dist_old)
+            grads_kl = torch.autograd.grad(kl, self.actor.parameters(), create_graph=True, retain_graph=True, 
                                         allow_unused=True)
-            flat_grads = self.flatten_grads(grads)
+            flat_grads_kl = self.flatten_grads(grads_kl)
+
+            # grads point in dir to maximize (ie lower reward)
+            grads_pg = torch.autograd.grad(actor_loss, self.actor.parameters(), retain_graph=True) 
+            grads_pg = torch.cat([grad.view(-1) for grad in grads_pg])
             
-            prod = torch.dot(flat_grads, y)
-            # second derivative
-            grads = torch.autograd.grad(prod, self.actor.parameters())
-            flat_grads = torch.cat([grad.contiguous().view(-1) for grad in grads]).data
+            # fisher-vector product
+            def FVP(y: Tensor):
+                prod = torch.dot(flat_grads_kl, y)
+                # second derivative
+                grads = torch.autograd.grad(prod, self.actor.parameters(), retain_graph=True)
+                flat_grads = torch.cat([grad.contiguous().view(-1) for grad in grads]).data
+                
+                return flat_grads + y * self.damping
             
-            return flat_grads + y * self.damping
-        
-        x_k = conjugate_gradient(FVP, grads_pg, device=self.device) # negate pg so that we continue to point
-        hessian_search = FVP(x_k)
-        beta = torch.sqrt(2 * self.trust_region / (torch.dot(x_k, hessian_search)))
-        step_dir = beta * x_k
-        
-        if self.categorical: 
-            updated, kl_div, actor_loss = backtracking_linesearch_with_kl(self, batch, advantages, (old_probs), step_dir, 1, actor_loss)
-        else:
-            updated, kl_div, actor_loss = backtracking_linesearch_with_kl(self, batch, advantages, (old_means, old_stds), step_dir, 1, actor_loss)
+            x_k = conjugate_gradient(FVP, grads_pg, device=self.device) # negate pg so that we continue to point
+            hessian_search = FVP(x_k)
+            beta = torch.sqrt(2 * self.trust_region / (torch.dot(x_k, hessian_search)))
+            step_dir = beta * x_k
+            
+            updated, kl_div, actor_loss = backtracking_linesearch_with_kl(self, batch, advantages, dist_old, step_dir, 1.0, actor_loss)
         
         # update critic
         for _ in range(self.critic_steps):
-            values = self.critic(batch.states)
-            critic_loss = self.critic_loss(values, batch.returns)
-            
-            self.critic_opt.zero_grad()
-            critic_loss.backward()
-            self.critic_opt.step()
-        
-        
+            for batch in rollout_data.get(batch_size=self.batch_size):
+                values = self.critic(batch.states)
+                critic_loss = self.critic_loss(batch.returns, values)
+                
+                self.critic_opt.zero_grad()
+                critic_loss.backward()
+                self.critic_opt.step()
+    
         return actor_loss.item(), critic_loss.item(), kl_div, updated
     
-    def actor_loss(self, states: Tensor, actions: Tensor, advantages: Tensor, old_prob: tuple):
+    def actor_loss(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: Tensor):
         if self.categorical:
-            return self.actor_loss_disc(states, actions, advantages, old_prob)
+            return self.actor_loss_disc(states, actions, advantages, old_log_probs)
         else:
-            return self.actor_loss_cont(states, actions, advantages, old_prob)
+            return self.actor_loss_cont(states, actions, advantages, old_log_probs)
     
     def flatten_grads(self, grads: Tensor):
         return torch.cat([grad.view(-1) for grad in grads])
@@ -300,6 +298,11 @@ class TRPOAgent:
     
 if __name__ == "__main__":
     # test run
-    agent = TRPOAgent('CartPole-v1')
-    agent.train(1000, window_size=35)
-    
+    agent = TRPOAgent(
+        'Swimmer-v5', 
+        device='cpu',
+        n_envs=1, 
+        n_steps=2048, 
+        n_update_steps=2000,
+    )
+    agent.train(window_size=100)

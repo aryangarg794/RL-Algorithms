@@ -34,3 +34,7 @@ class RollingAverage:
     @property
     def get_average(self) -> float:
         return sum(self.window) / len(self.window) if self.window else 0.0
+    
+def explained_variance(y_pred, y_true):
+    var_y = np.var(y_true)
+    return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
