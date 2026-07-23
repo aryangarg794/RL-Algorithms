@@ -218,7 +218,7 @@ class TRPO:
             results['ep_rew_mean'].append(rew_mean)
             results['kls'].append(kl)
         
-            pbar.set_description(f"Episode: {ep}")
+            pbar.set_description(f"Num Update Steps: {ep}")
             pbar.set_postfix(postfix)
         
         return results
@@ -324,14 +324,14 @@ def train_trpo(
     trust_region: Annotated[float, typer.Option(help='trust region coeff')] = 0.01, 
     act_hidden: Annotated[List[int], typer.Option(help='actor hidden dims')] = list([400, 300]),
     critic_hidden: Annotated[List[int], typer.Option(help='critic hidden dims')] = list([400, 300]),
-    damping: Annotated[float, typer.Option(help='damping coeff')] = 0.1, 
+    damping: Annotated[float, typer.Option(help='damping coeff')] = 0.0, 
     device: Annotated[str, typer.Option(help='device')] = 'cuda', 
     num_critic_updates: Annotated[int, typer.Option(help='num critic updates per actor updates')] = 10, 
     norm_adv: Annotated[bool, typer.Option(help='normalize adv')] = True, 
     n_envs: Annotated[int, typer.Option(help='num of envs')] = 5, 
     batch_size: Annotated[int, typer.Option(help='batch size')] = 128, 
     n_steps: Annotated[int, typer.Option(help='num of steps per rollout')] = 512,
-    total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = 500_000,
+    total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = 100_000,
     window_size: Annotated[int, typer.Option(help='window size to average the ep rews')] = 100,
     seeds: Annotated[List[int], typer.Option(help='seeds to run')] = list([0, 1, 2, 3]),
     save: Annotated[bool, typer.Option(help='save model/results')] = False,
@@ -339,9 +339,9 @@ def train_trpo(
 ):
     results = {}
     run_name = run_name + f"_{env_id}"
-    os.makedirs('/results/trpo/media', exist_ok=True)
-    os.makedirs('/results/trpo/objs', exist_ok=True)
-    os.makedirs('/results/trpo/models', exist_ok=True)
+    os.makedirs('./results/trpo/media', exist_ok=True)
+    os.makedirs('./results/trpo/objs', exist_ok=True)
+    os.makedirs('./results/trpo/models', exist_ok=True)
     plt.style.use('ggplot')
 
     for seed in seeds:
@@ -373,7 +373,7 @@ def train_trpo(
         if save:
             model.save(f'results/trpo/models/{run_name}_seed_{seed}')
 
-    fig, axes = plt.subplots(2, 2)
+    fig, axes = plt.subplots(2, 2, figsize=(20, 15))
     results = convert_results(results)
     plot_results(results['ep_rew_mean'], axes[0, 0], total_timesteps, 'TRPO', 'Timesteps', 'Average Ep Reward', 
                  'Average Episodic Reward over Time', 'red')
@@ -382,8 +382,19 @@ def train_trpo(
     plot_results(results['cr_losses'], axes[1, 0], total_timesteps, 'TRPO', 'Timesteps', 'Critic Loss', 
                  'Critic Loss over Time', 'green')
     plot_results(results['kls'], axes[1, 1], total_timesteps, 'TRPO', 'Timesteps', 'KL Div (new/old)', 
-                 'KL Div between new/old Policy over Time', 'yellow')
+                 'KL Div between new/old Policy over Time', 'purple')
+    
+    line_style = {
+        "linestyle": "--",
+        "color": "purple",
+        "linewidth": 1.5,
+        "alpha": 0.8,
+        "zorder": 2 
+    }
+    axes[1, 1].axhline(y=trust_region, label='Trust Region', **line_style)
+    axes[1, 1].legend()
 
+    plt.tight_layout()
     fig.savefig(f'results/trpo/media/{run_name}.png')
 
 

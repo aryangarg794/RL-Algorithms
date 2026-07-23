@@ -21,6 +21,6 @@ def plot_results(data, ax, timesteps, label, xlabel, ylabel, title, color='red',
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.grid()
+    ax.grid(True)
     ax.legend()
     return ax

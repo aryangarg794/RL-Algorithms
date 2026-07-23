@@ -45,3 +45,5 @@ def convert_results(results: dict):
     for seed, dic in results.items():
         for key, arr in dic.items():
             new_results[key][seed, :] = np.array(arr)
+
+    return new_results
