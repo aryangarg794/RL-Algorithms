@@ -1,6 +1,6 @@
 import numpy as np
 
-from collections import deque
+from collections import deque, defaultdict
 
         
 def compute_returns(rewards: list, discount: float):
@@ -38,3 +38,10 @@ class RollingAverage:
 def explained_variance(y_pred, y_true):
     var_y = np.var(y_true)
     return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+def convert_results(results: dict):
+    array_shape = (len(results.keys()), len(results[0]['ep_rew_mean']))
+    new_results = defaultdict(lambda: np.zeros(array_shape))
+    for seed, dic in results.items():
+        for key, arr in dic.items():
+            new_results[key][seed, :] = np.array(arr)

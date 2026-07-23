@@ -1,19 +1,26 @@
-import argparse
 import gymnasium as gym
+import dill
 import numpy as np
+import matplotlib.pyplot as plt
+import os
+import random
 import torch
 import torch.nn as nn
+import typer
 
 from copy import deepcopy
+from collections import defaultdict
 from gymnasium.spaces.discrete import Discrete
 from gymnasium.spaces.multi_discrete import MultiDiscrete
 from torch import Tensor
 from torch import distributions as dist
 from tqdm import tqdm
+from typing import List, Annotated
 
 from rl_algorithms.common.optimization_methods import conjugate_gradient, backtracking_linesearch_with_kl
 from rl_algorithms.common.buffers import RolloutBufferBatch, Runner
-from rl_algorithms.common.utils import explained_variance
+from rl_algorithms.common.utils import explained_variance, convert_results
+from rl_algorithms.common.plotting import plot_results
 
 # some inspiration take from https://github.com/ikostrikov/pytorch-trpo (particularly grad directions etc)
 
@@ -76,7 +83,7 @@ class ActorDisc(nn.Module):
         logits = self.ffn(states)
         return logits
 
-class TRPOAgent:
+class TRPO:
     
     def __init__(
         self, 
@@ -189,8 +196,7 @@ class TRPOAgent:
         return torch.distributions.kl_divergence(dist_new, dist_old).mean()
     
     def train(self, total_timesteps: int, window_size: int = 100):
-        act_losses = []
-        cr_losses = []
+        results = defaultdict(list)
         n_updates = 0
         
         num_eps = int(total_timesteps / (self.n_envs * self.n_steps))
@@ -198,20 +204,24 @@ class TRPOAgent:
             rollout_data = self.runner.run_rollout(self)
             act_loss, cr_loss, kl, updated = self.update_step(rollout_data)
             n_updates += int(updated)
-            act_losses.append(act_loss)
-            cr_losses.append(cr_loss)
-
+            results['act_losses'].append(act_loss)
+            results['cr_losses'].append(cr_loss)
+            
             postfix = {}
-            postfix["avg_rew"] = np.mean(list(self.runner.envs.return_queue)[-window_size:])
-            postfix["act_loss"] = act_losses[-1]
-            postfix["critic_loss"] = cr_losses[-1]
+            rew_mean = np.mean(list(self.runner.envs.return_queue)[-window_size:])
+            postfix["avg_rew"] = rew_mean
+            postfix["act_loss"] = act_loss
+            postfix["critic_loss"] = cr_loss
             postfix["kl_div"] = kl
             postfix["num_updates"] = n_updates
+
+            results['ep_rew_mean'].append(rew_mean)
+            results['kls'].append(kl)
         
             pbar.set_description(f"Episode: {ep}")
             pbar.set_postfix(postfix)
         
-        return act_losses, cr_losses
+        return results
     
     
     def get_distribution(self, states: Tensor):
@@ -294,7 +304,7 @@ class TRPOAgent:
         torch.save({
             'actor_dict': self.actor.state_dict(),
             'critic_dict': self.critic.state_dict()
-        }, f'models/TRPO_{file_path}.pt')
+        }, f'{file_path}.pt')
         
     def load(self, file_path: str): 
         saved_model = torch.load(file_path, weights_only=True)
@@ -306,15 +316,82 @@ class TRPOAgent:
         # returns a copy 
         return torch.cat([grad.flatten() for grad in self.actor.parameters()])
     
-    
-    
-if __name__ == "__main__":
-    # test run
-    agent = TRPOAgent(
-        'CartPole-v1', 
-        device='cpu',
-        n_envs=1, 
-        n_steps=2048, 
-        n_update_steps=2000,
-    )
-    agent.train(total_timesteps=700000, window_size=100)
+
+def train_trpo(
+    env_id: Annotated[str, typer.Option(help='environment to test on (has to be gym env)')], 
+    lr_critic: Annotated[float, typer.Option(help='lr for critic')] = 1e-3, 
+    discount: Annotated[float, typer.Option(help='gamma')] = 0.99,
+    trust_region: Annotated[float, typer.Option(help='trust region coeff')] = 0.01, 
+    act_hidden: Annotated[List[int], typer.Option(help='actor hidden dims')] = list([400, 300]),
+    critic_hidden: Annotated[List[int], typer.Option(help='critic hidden dims')] = list([400, 300]),
+    damping: Annotated[float, typer.Option(help='damping coeff')] = 0.1, 
+    device: Annotated[str, typer.Option(help='device')] = 'cuda', 
+    num_critic_updates: Annotated[int, typer.Option(help='num critic updates per actor updates')] = 10, 
+    norm_adv: Annotated[bool, typer.Option(help='normalize adv')] = True, 
+    n_envs: Annotated[int, typer.Option(help='num of envs')] = 5, 
+    batch_size: Annotated[int, typer.Option(help='batch size')] = 128, 
+    n_steps: Annotated[int, typer.Option(help='num of steps per rollout')] = 512,
+    total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = 500_000,
+    window_size: Annotated[int, typer.Option(help='window size to average the ep rews')] = 100,
+    seeds: Annotated[List[int], typer.Option(help='seeds to run')] = list([0, 1, 2, 3]),
+    save: Annotated[bool, typer.Option(help='save model/results')] = False,
+    run_name: Annotated[str, typer.Option(help='name of the run')] = "trpo"
+):
+    results = {}
+    run_name = run_name + f"_{env_id}"
+    os.makedirs('/results/trpo/media', exist_ok=True)
+    os.makedirs('/results/trpo/objs', exist_ok=True)
+    os.makedirs('/results/trpo/models', exist_ok=True)
+    plt.style.use('ggplot')
+
+    for seed in seeds:
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+        model = TRPO(
+            env_id=env_id,
+            lr_critic=lr_critic,
+            discount=discount,
+            trust_region=trust_region,
+            act_hidden=act_hidden,
+            critic_hidden=critic_hidden,
+            damping=damping, 
+            device=device, 
+            num_critic_updates=num_critic_updates, 
+            norm_adv=norm_adv, 
+            n_envs=n_envs, 
+            batch_size=batch_size, 
+            n_steps=n_steps, 
+        )
+
+        results_seed = model.train(total_timesteps=total_timesteps, window_size=window_size)
+        results[seed] = results_seed
+
+        if save:
+            model.save(f'results/trpo/models/{run_name}_seed_{seed}')
+
+    fig, axes = plt.subplots(2, 2)
+    results = convert_results(results)
+    plot_results(results['ep_rew_mean'], axes[0, 0], total_timesteps, 'TRPO', 'Timesteps', 'Average Ep Reward', 
+                 'Average Episodic Reward over Time', 'red')
+    plot_results(results['act_losses'], axes[0, 1], total_timesteps, 'TRPO', 'Timesteps', 'Actor Loss', 
+                 'Actor Loss over Time', 'blue')
+    plot_results(results['cr_losses'], axes[1, 0], total_timesteps, 'TRPO', 'Timesteps', 'Critic Loss', 
+                 'Critic Loss over Time', 'green')
+    plot_results(results['kls'], axes[1, 1], total_timesteps, 'TRPO', 'Timesteps', 'KL Div (new/old)', 
+                 'KL Div between new/old Policy over Time', 'yellow')
+
+    fig.savefig(f'results/trpo/media/{run_name}.png')
+
+
+    if save:
+        with open(f'/results/trpo/objs/{run_name}.pl', 'wb') as file:
+            dill.dump(results, file)
+            file.close()
+        
+        
+
+    return 
