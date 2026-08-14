@@ -107,3 +107,6 @@ Example `--help` for TRPO:
 
 The results of each algorithm reproduction/investigation can be found here
 - [TRPO Results](results/trpo/trpo.md)
+
+## QoL TODOs
+- Callback functionality (evalution specifically)

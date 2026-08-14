@@ -12,7 +12,7 @@ def conjugate_gradient(
     eps: float = 1e-10, 
     device: str = 'cuda'
 ):
-    x = 1e-4 * torch.randn_like(b, device=device) # based on sb3 implementation 
+    x = 1e-4 * torch.zeros_like(b, device=device) # based on sb3 implementation 
     res = b - FVP(x)
     d = res.clone()
     error = torch.dot(res, res)
@@ -43,25 +43,29 @@ def backtracking_linesearch_with_kl(
     step_dir: Tensor, 
     start: float, 
     initial_loss: float | Tensor, 
-    c: float = 0.5, 
+    c: float = 0.8, 
     max_iter: int = 10
 ):
     update = False
     expn = start
     old_loss = initial_loss
-    old_weights = model.actor_params.clone()
+    old_weights = model.actor_params.clone().detach()
     for i in range(max_iter):
         new_params = old_weights + expn * step_dir
         model.update_actor_weights(new_params)
         act_loss, dist_new = model.actor_loss(batch.states, batch.actions, advantages, batch.log_probs)
         kl = model.kl_div(dist_new, dist_old)
-        if act_loss > old_loss and kl <= model.trust_region:
+        if act_loss > old_loss and kl < model.trust_region:
             update = True
             break
     
         expn *= c
         
     if not update:
+        actor_params = old_weights
         model.update_actor_weights(old_weights)
+        act_loss = old_loss
+    else:
+        actor_params = new_params
     
-    return update, kl.item() if update else 0.0, act_loss
+    return update, kl.item() if update else 0.0, act_loss, actor_params

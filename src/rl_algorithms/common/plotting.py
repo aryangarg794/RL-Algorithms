@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_results(data, ax, timesteps, label, xlabel, ylabel, title, color='red', q=95):
+def plot_results(data, ax, timesteps, label, xlabel, ylabel, title, color='red', q=95, compare=None):
     data = np.asarray(data)
     num_seeds, num_datapoints = data.shape
     means = np.mean(data, axis=0)

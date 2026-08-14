@@ -5,6 +5,7 @@ import torch
 from functools import partial
 from gymnasium.spaces.discrete import Discrete
 from torch import Tensor
+from stable_baselines3.common.running_mean_std import RunningMeanStd
 
 from rl_algorithms.common.utils import compute_returns
 
@@ -175,6 +176,8 @@ class BasicBuffer:
     
     def sanitize(self, state: np.ndarray):
         return torch.from_numpy(state).float().to(device=self.device).view(1, -1)
+
+    
 class Runner:
     
     def __init__(
@@ -182,6 +185,8 @@ class Runner:
         env_id: str, 
         device: str = 'cuda',
         n_steps: int = 512, 
+        normalize_state: bool = False, 
+        normalize_rews: bool = False, 
         n_envs: int = 8, 
         discount: float = 0.99
     ):
@@ -189,6 +194,9 @@ class Runner:
         self.num_envs = n_envs
         self.n_steps = n_steps
         self.discount = discount
+        self.normalize_state = normalize_state
+        self.normalize_rews = normalize_rews
+        self.epsilon = 1e-8
         envs = gym.make_vec(env_id, num_envs=n_envs)
             
         self.envs = gym.wrappers.vector.RecordEpisodeStatistics(
@@ -202,8 +210,38 @@ class Runner:
         self.batch_class = partial(RolloutBuffer, self.obs_shape, self.action_shape)
         self.global_step = 0
         self._cur_states = None
+        self.training = True
+        self.returns_rms = np.zeros(self.num_envs)
+
+        if self.normalize_state:
+            self.obs_rms = RunningMeanStd(shape=self.obs_shape)
         
-    def run_rollout(self, policy):
+        if self.normalize_rews:
+            self.ret_rms = RunningMeanStd(shape=())
+
+
+    def normalize_obs(self, obs: Tensor | np.ndarray):
+        if not isinstance(obs, np.ndarray):
+            obs = obs.cpu().numpy()
+        normalized = (obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon)
+        return torch.from_numpy(normalized).to(self.device).float()
+
+    def normalize_rew(self, rew: Tensor):
+        rew = rew.cpu().numpy()
+        normalized = (rew / np.sqrt(self.ret_rms.var + self.epsilon))
+        return torch.from_numpy(normalized).to(self.device).float()
+
+    def unnormalize_obs(self, obs: np.ndarray):
+        return (obs * np.sqrt(self.obs_rms.var + self.epsilon)) + self.obs_rms.mean
+
+    def unnormalize_rew(self, rew: np.ndarray):
+        return rew * np.sqrt(self.ret_rms.var + self.epsilon)
+
+    def _update_rew(self, rewards: np.ndarray):
+        self.returns_rms = rewards + self.discount * self.returns_rms
+        self.ret_rms.update(self.returns_rms)
+        
+    def run_rollout(self, policy, seed: int = 0):
         states_buffer = torch.zeros((self.n_steps, self.num_envs, self.obs_shape), device=self.device)
         actions_buffer = torch.zeros((self.n_steps, self.num_envs, self.action_shape), device=self.device)
         rewards_buffer = torch.zeros((self.n_steps, self.num_envs, 1), device=self.device)
@@ -214,36 +252,53 @@ class Runner:
         for step in range(self.n_steps):
 
             if self.global_step == 0:
-                self._cur_states, _ = self.envs.reset()
+                self._cur_states, _ = self.envs.reset(seed=seed)
+
+            if self.training and self.normalize_state:
+                self.obs_rms.update(self._cur_states)
+
+            obs = self.normalize_obs(self._cur_states) if self.normalize_state else self._cur_states
 
             states_buffer[step] = torch.from_numpy(self._cur_states).to(self.device)
-            actions, log_probs = policy.sample_action(self._cur_states, return_np=True)
+            actions, log_probs = policy.sample_action(obs, return_np=True)
             actions_buffer[step] = torch.from_numpy(actions).to(self.device).view(-1, self.action_shape)
             log_probs_buffer[step] = log_probs
 
             self._cur_states, rewards, terminated, truncated, _ = self.envs.step(actions)
+
+            if self.training and self.normalize_rews:
+                self._update_rew(rewards)
+                self.returns_rms[terminated | truncated] = 0 
+
             next_states_buffer[step] = torch.from_numpy(self._cur_states).to(self.device)
             rewards_buffer[step] = torch.from_numpy(rewards).to(self.device).view(-1, 1)
             dones_buffer[step] = torch.from_numpy(terminated).to(self.device).view(-1, 1)
 
             self.global_step += 1
-
+        
+        rewards_buffer = self.normalize_rew(rewards_buffer.view(-1, 1)) if self.normalize_rews else rewards_buffer.view(-1, 1)
+        states_buffer = self.normalize_obs(states_buffer.view(-1, self.obs_shape)) if self.normalize_state else states_buffer.view(-1, self.obs_shape)
+        next_states_buffer = self.normalize_obs(next_states_buffer.view(-1, self.obs_shape)) if self.normalize_state else next_states_buffer.view(-1, self.obs_shape)
+        
         returns_buffer, advs_buffer = self.compute_boot_returns(
             policy=policy, states=states_buffer, next_states=next_states_buffer, 
-            rewards=rewards_buffer, dones=dones_buffer
+            rewards=rewards_buffer, dones=dones_buffer.view(-1, 1)
         )
         
         return self.batch_class(
             states=states_buffer, 
-            actions=actions_buffer, 
+            actions=actions_buffer.view(-1, self.action_shape), 
             rewards=rewards_buffer,
             next_states=next_states_buffer, 
-            dones=dones_buffer, 
-            log_probs=log_probs_buffer, 
-            returns=returns_buffer,
-            advantages=advs_buffer, 
+            dones=dones_buffer.view(-1, 1), 
+            log_probs=log_probs_buffer.view(-1, 1), 
+            returns=returns_buffer.view(-1, 1),
+            advantages=advs_buffer.view(-1, 1), 
             device=self.device
         )
+
+    def set_training(self, mode: bool):
+        self.training = mode
     
     def compute_boot_returns(self, policy, states, next_states, rewards, dones):
         with torch.no_grad():

@@ -21,6 +21,7 @@ from rl_algorithms.common.optimization_methods import conjugate_gradient, backtr
 from rl_algorithms.common.buffers import RolloutBufferBatch, Runner
 from rl_algorithms.common.utils import explained_variance, convert_results
 from rl_algorithms.common.plotting import plot_results
+from rl_algorithms.common.inits import kaiming_init, orthogonal_init, init_trpo
 
 # some inspiration take from https://github.com/ikostrikov/pytorch-trpo (particularly grad directions etc)
 
@@ -98,17 +99,20 @@ class TRPO:
         device: str = 'cuda', 
         num_critic_updates: int = 10, 
         norm_adv: bool = True, 
+        init: str = 'orth', 
         n_envs: int = 5, 
         batch_size: int = 128, 
+        normalize_obs: bool = False, 
+        normalize_rew: bool = False, 
         n_steps: int = 512,
         *args, 
         **kwargs
     ):
-        self.runner = Runner(env_id, device=device, n_envs=n_envs, n_steps=n_steps)
+        self.runner = Runner(env_id, device=device, n_envs=n_envs, n_steps=n_steps, discount=discount, 
+                             normalize_state=normalize_obs, normalize_rews=normalize_rew)
         self.categorical = True if isinstance(self.runner.envs.action_space, (Discrete, MultiDiscrete)) else False
         self.action_shape = self.runner.envs.single_action_space.n if self.categorical else self.runner.action_shape
         self.obs_shape = self.runner.obs_shape
-        self.discount = discount
         self.trust_region = trust_region
         self.damping = damping
         self.device = device
@@ -117,6 +121,7 @@ class TRPO:
         self.n_envs = n_envs
         self.batch_size = batch_size
         self.n_steps = n_steps
+        self.init = init
 
         if self.categorical:
             self.actor = ActorDisc(self.obs_shape, self.action_shape, act_hidden=act_hidden, act=act).to(device)
@@ -136,7 +141,15 @@ class TRPO:
         self.critic.to(device)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
         self.critic_loss = nn.MSELoss()
-         
+
+        if self.init == 'orth':
+            orthogonal_init(self.actor)
+            orthogonal_init(self.critic)
+        elif self.init == 'kaiming':
+            kaiming_init(self.actor)
+            kaiming_init(self.critic)
+        elif self.init == 'trpo':
+            init_trpo(self.actor)
         
     def __call__(self, states: Tensor):
         if self.categorical:
@@ -179,7 +192,7 @@ class TRPO:
         dist_new = dist.Normal(loc=new_means, scale=new_std)
         log_std_new = dist_new.log_prob(actions)
 
-        ratios = torch.exp(log_std_new - old_log_probs).sum(1, keepdim=True)
+        ratios = torch.exp((log_std_new - old_log_probs).sum(dim=1, keepdim=True))
     
         return (advantages * ratios).mean(), dist_new
     
@@ -195,32 +208,35 @@ class TRPO:
     def kl_div(self, dist_new: dist.Distribution, dist_old: dist.Distribution):
         return torch.distributions.kl_divergence(dist_new, dist_old).mean()
     
-    def train(self, total_timesteps: int, window_size: int = 100):
+    def train(self, total_timesteps: int, window_size: int = 100, seed: int = 0):
         results = defaultdict(list)
         n_updates = 0
+        # self.runner.set_training(True)
         
         num_eps = int(total_timesteps / (self.n_envs * self.n_steps))
         for ep in (pbar := tqdm(range(1, num_eps+1))):
-            rollout_data = self.runner.run_rollout(self)
-            act_loss, cr_loss, kl, updated = self.update_step(rollout_data)
+            rollout_data = self.runner.run_rollout(self, seed=seed)
+            act_loss, cr_loss, kl, updated, var = self.update_step(rollout_data)
             n_updates += int(updated)
             results['act_losses'].append(act_loss)
             results['cr_losses'].append(cr_loss)
             
             postfix = {}
             rew_mean = np.mean(list(self.runner.envs.return_queue)[-window_size:])
-            postfix["avg_rew"] = rew_mean
+            postfix["rew"] = rew_mean
             postfix["act_loss"] = act_loss
             postfix["critic_loss"] = cr_loss
-            postfix["kl_div"] = kl
-            postfix["num_updates"] = n_updates
+            postfix["ev"] = var
+            postfix["kl"] = kl
+            postfix["n_updates"] = n_updates
 
             results['ep_rew_mean'].append(rew_mean)
             results['kls'].append(kl)
         
             pbar.set_description(f"Num Update Steps: {ep}")
             pbar.set_postfix(postfix)
-        
+
+        # self.runner.set_training(False)
         return results
     
     
@@ -277,19 +293,26 @@ class TRPO:
             beta = torch.sqrt(2 * self.trust_region / (torch.dot(x_k, hessian_search)))
             step_dir = beta * x_k
             
-            updated, kl_div, actor_loss = backtracking_linesearch_with_kl(self, batch, advantages, dist_old, step_dir, 1.0, actor_loss)
+            updated, kl_div, actor_loss, actor_params = backtracking_linesearch_with_kl(self, batch, advantages, dist_old, step_dir, 1.0, actor_loss)
         
         # update critic
+        expl_var = 0
+        steps = 0
         for _ in range(self.critic_steps):
             for batch in rollout_data.get(batch_size=self.batch_size):
                 values = self.critic(batch.states)
                 critic_loss = self.critic_loss(batch.returns, values)
+                expl_var += explained_variance(values.detach().cpu().numpy(), batch.returns.detach().cpu().numpy())
+                steps += 1
                 
                 self.critic_opt.zero_grad()
                 critic_loss.backward()
                 self.critic_opt.step()
+
+        expl_var /= steps
+
     
-        return actor_loss.item(), critic_loss.item(), kl_div, updated
+        return actor_loss.item(), critic_loss.item(), kl_div, updated, expl_var
     
     def actor_loss(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: Tensor):
         if self.categorical:
@@ -325,18 +348,21 @@ def train_trpo(
     act_hidden: Annotated[List[int], typer.Option(help='actor hidden dims')] = list([400, 300]),
     critic_hidden: Annotated[List[int], typer.Option(help='critic hidden dims')] = list([400, 300]),
     damping: Annotated[float, typer.Option(help='damping coeff')] = 0.0, 
-    device: Annotated[str, typer.Option(help='device')] = 'cuda', 
     num_critic_updates: Annotated[int, typer.Option(help='num critic updates per actor updates')] = 10, 
     norm_adv: Annotated[bool, typer.Option(help='normalize adv')] = True, 
-    n_envs: Annotated[int, typer.Option(help='num of envs')] = 5, 
+    n_envs: Annotated[int, typer.Option(help='num of envs')] = 1, 
+    init: Annotated[str, typer.Option(help='init of the nn')] = "trpo", 
     batch_size: Annotated[int, typer.Option(help='batch size')] = 128, 
-    n_steps: Annotated[int, typer.Option(help='num of steps per rollout')] = 512,
-    total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = 100_000,
+    n_steps: Annotated[int, typer.Option(help='num of steps per rollout')] = 2048,
+    total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = int(5e5),
     window_size: Annotated[int, typer.Option(help='window size to average the ep rews')] = 100,
     seeds: Annotated[List[int], typer.Option(help='seeds to run')] = list([0, 1, 2, 3]),
     save: Annotated[bool, typer.Option(help='save model/results')] = False,
+    normalize_obs: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
+    normalize_rew: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
     run_name: Annotated[str, typer.Option(help='name of the run')] = "trpo"
-):
+):  
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     results = {}
     run_name = run_name + f"_{env_id}"
     os.makedirs('./results/trpo/media', exist_ok=True)
@@ -356,6 +382,8 @@ def train_trpo(
             lr_critic=lr_critic,
             discount=discount,
             trust_region=trust_region,
+            normalize_obs=normalize_obs, 
+            normalize_rew=normalize_rew,
             act_hidden=act_hidden,
             critic_hidden=critic_hidden,
             damping=damping, 
@@ -363,11 +391,12 @@ def train_trpo(
             num_critic_updates=num_critic_updates, 
             norm_adv=norm_adv, 
             n_envs=n_envs, 
-            batch_size=batch_size, 
-            n_steps=n_steps, 
+            batch_size=batch_size,
+            init=init,  
+            n_steps=n_steps
         )
 
-        results_seed = model.train(total_timesteps=total_timesteps, window_size=window_size)
+        results_seed = model.train(total_timesteps=total_timesteps, window_size=window_size, seed=seed)
         results[seed] = results_seed
 
         if save:
@@ -402,7 +431,3 @@ def train_trpo(
         with open(f'/results/trpo/objs/{run_name}.pl', 'wb') as file:
             dill.dump(results, file)
             file.close()
-        
-        
-
-    return 
