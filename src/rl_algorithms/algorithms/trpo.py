@@ -367,7 +367,8 @@ def train_trpo(
     total_timesteps: Annotated[int, typer.Option(help='num total training steps')] = int(5e5),
     window_size: Annotated[int, typer.Option(help='window size to average the ep rews')] = 100,
     seeds: Annotated[List[int], typer.Option(help='seeds to run')] = list([0, 1, 2, 3]),
-    save: Annotated[bool, typer.Option(help='save model/results')] = False,
+    save: Annotated[bool, typer.Option(help='save results')] = False,
+    save_model: Annotated[bool, typer.Option(help='save model')] = False,
     c: Annotated[float, typer.Option(help='line search coefficient')] = 0.8, 
     normalize_obs: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
     normalize_rew: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
@@ -411,7 +412,7 @@ def train_trpo(
         results_seed = model.train(total_timesteps=total_timesteps, window_size=window_size, seed=seed)
         results[seed] = results_seed
 
-        if save:
+        if save_model:
             model.save(f'results/trpo/models/trpo_{run_name}_seed_{seed}')
 
     fig, axes = plt.subplots(2, 2, figsize=(20, 15))

@@ -16,7 +16,7 @@ Running on several environments from Gymnasium shows that the model is able to l
 **Pendulum-v1**
 ![Results cartpole](media/trpo_Pendulum-v1.png)
 `n-steps = 512`
-`c = 0.5`
+`c = 0.8`
 `init = none`
 
 **InvertedPendulum-v5**
