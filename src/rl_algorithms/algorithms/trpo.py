@@ -32,7 +32,7 @@ class ActorCont(nn.Module):
         obs_shape: int, 
         action_shape: int, 
         act_hidden: list = list([]),
-        act: nn.Module = nn.ReLU,
+        act: nn.Module = nn.Tanh,
         *args, 
         **kwargs
     ):
@@ -62,7 +62,7 @@ class ActorDisc(nn.Module):
         obs_shape: int, 
         action_shape: int, 
         act_hidden: list = list([]),
-        act: nn.Module = nn.ReLU,
+        act: nn.Module = nn.Tanh,
         *args, 
         **kwargs
     ):
@@ -102,6 +102,7 @@ class TRPO:
         init: str = 'orth', 
         n_envs: int = 5, 
         batch_size: int = 128, 
+        c: float = 0.8, 
         normalize_obs: bool = False, 
         normalize_rew: bool = False, 
         n_steps: int = 512,
@@ -114,6 +115,7 @@ class TRPO:
         self.action_shape = self.runner.envs.single_action_space.n if self.categorical else self.runner.action_shape
         self.obs_shape = self.runner.obs_shape
         self.trust_region = trust_region
+        self.c = c
         self.damping = damping
         self.device = device
         self.critic_steps = num_critic_updates
@@ -232,6 +234,7 @@ class TRPO:
 
             results['ep_rew_mean'].append(rew_mean)
             results['kls'].append(kl)
+            results['evs'].append(var)
         
             pbar.set_description(f"Num Update Steps: {ep}")
             pbar.set_postfix(postfix)
@@ -293,25 +296,32 @@ class TRPO:
             beta = torch.sqrt(2 * self.trust_region / (torch.dot(x_k, hessian_search)))
             step_dir = beta * x_k
             
-            updated, kl_div, actor_loss, actor_params = backtracking_linesearch_with_kl(self, batch, advantages, dist_old, step_dir, 1.0, actor_loss)
+            updated, kl_div, actor_loss, actor_params = backtracking_linesearch_with_kl(self, batch, advantages, dist_old, step_dir, 1.0, actor_loss, c=self.c)
         
         # update critic
-        expl_var = 0
-        steps = 0
         for _ in range(self.critic_steps):
             for batch in rollout_data.get(batch_size=self.batch_size):
                 values = self.critic(batch.states)
                 critic_loss = self.critic_loss(batch.returns, values)
-                expl_var += explained_variance(values.detach().cpu().numpy(), batch.returns.detach().cpu().numpy())
-                steps += 1
                 
                 self.critic_opt.zero_grad()
                 critic_loss.backward()
                 self.critic_opt.step()
 
-        expl_var /= steps
+        evs = []
 
-    
+        with torch.no_grad():
+            for batch in rollout_data.get(batch_size=self.batch_size):
+                values = self.critic(batch.states)
+
+                evs.append(
+                    explained_variance(
+                        values.cpu().numpy(),
+                        batch.returns.cpu().numpy()
+                    )
+                )
+
+        expl_var = np.mean(evs)
         return actor_loss.item(), critic_loss.item(), kl_div, updated, expl_var
     
     def actor_loss(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: Tensor):
@@ -358,6 +368,7 @@ def train_trpo(
     window_size: Annotated[int, typer.Option(help='window size to average the ep rews')] = 100,
     seeds: Annotated[List[int], typer.Option(help='seeds to run')] = list([0, 1, 2, 3]),
     save: Annotated[bool, typer.Option(help='save model/results')] = False,
+    c: Annotated[float, typer.Option(help='line search coefficient')] = 0.8, 
     normalize_obs: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
     normalize_rew: Annotated[bool, typer.Option(help='normalize obs/rew etc')] = False,
     run_name: Annotated[str, typer.Option(help='name of the run')] = "trpo"
@@ -388,6 +399,7 @@ def train_trpo(
             critic_hidden=critic_hidden,
             damping=damping, 
             device=device, 
+            c=c,
             num_critic_updates=num_critic_updates, 
             norm_adv=norm_adv, 
             n_envs=n_envs, 
@@ -400,7 +412,7 @@ def train_trpo(
         results[seed] = results_seed
 
         if save:
-            model.save(f'results/trpo/models/{run_name}_seed_{seed}')
+            model.save(f'results/trpo/models/trpo_{run_name}_seed_{seed}')
 
     fig, axes = plt.subplots(2, 2, figsize=(20, 15))
     results = convert_results(results)
@@ -428,6 +440,6 @@ def train_trpo(
 
 
     if save:
-        with open(f'/results/trpo/objs/{run_name}.pl', 'wb') as file:
+        with open(f'results/trpo/objs/{run_name}.pl', 'wb') as file:
             dill.dump(results, file)
             file.close()

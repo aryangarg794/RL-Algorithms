@@ -43,7 +43,7 @@ def backtracking_linesearch_with_kl(
     step_dir: Tensor, 
     start: float, 
     initial_loss: float | Tensor, 
-    c: float = 0.8, 
+    c: float = 0.5, 
     max_iter: int = 10
 ):
     update = False
