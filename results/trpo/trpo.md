@@ -40,7 +40,7 @@ Some other things that I noticed were:
 - Initialization of the actor network is quite important. Different intialization led to different performances. Specifically the "trpo" initialization was necessary for the Cartpole env to converge. 
 - Usually multi-env didn't help much with learning, and sticking to a single env with a eff batch size was more effective. 
 - Initialization of the conjugate method is not that important I tried, both zeros and random normal initialization, but the results were similar. 
-- Comparison with original TRPO is difficult to intrepret, but comparison with DDPG from CleanRL shows improvement in InvertedPendulum, but a drastic difference in Hopper. I also compared with SB3-contrib version of TRPO and results are similar (though singular seed & hyperparameters kept the same).
+- Comparison with original TRPO is difficult to intrepret, but comparison with DDPG from CleanRL shows improvement in InvertedPendulum, but a drastic decline in Hopper. I also compared with SB3-contrib version of TRPO and results are similar, or better in the case of Hopper-v4 (though singular seed & hyperparameters kept the same).
 - Most implementations use GAE, but I tried to keep to the paper and don't use that.
 
 -----------------
