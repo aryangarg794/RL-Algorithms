@@ -308,20 +308,10 @@ class TRPO:
                 critic_loss.backward()
                 self.critic_opt.step()
 
-        evs = []
-
         with torch.no_grad():
-            for batch in rollout_data.get(batch_size=self.batch_size):
-                values = self.critic(batch.states)
+            values_buffer = self.critic(batch.states)
+            expl_var = explained_variance(values_buffer.cpu().numpy(), batch.returns.cpu().numpy())
 
-                evs.append(
-                    explained_variance(
-                        values.cpu().numpy(),
-                        batch.returns.cpu().numpy()
-                    )
-                )
-
-        expl_var = np.mean(evs)
         return actor_loss.item(), critic_loss.item(), kl_div, updated, expl_var
     
     def actor_loss(self, states: Tensor, actions: Tensor, advantages: Tensor, old_log_probs: Tensor):
